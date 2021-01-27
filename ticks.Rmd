@@ -1,0 +1,242 @@
+---
+title: Stan Example
+subtitle: QERM 597 Wi 21
+date: January 27, 2021
+---
+
+# Preparation
+
+## Packages
+
+We'll use the `rstan` package (an alternative would be the `rcmdstan` package),
+and the `tidyverse`. Note that there are 
+
+```{r}
+library(rstan)
+library(tidyverse)
+
+## Use parallel cores for different chains as recommended in the rstan package
+## message
+options(mc.cores = parallel::detectCores())
+options(digits = 2)
+```
+
+
+## Dataset
+
+Here we'll use the `grouseticks` data set, which is built into the `lme4` data set.
+
+```{r}
+data(grouseticks, package = "lme4")
+```
+
+The response we're interested in is `TICKS`, the number of ticks on the head of
+a grouse chick. Other covariates include:
+
+- `BROOD`: brood code
+- `HEIGHT`: height of the chick
+- `YEAR`: two-digit year
+- `LOCATION`: location code for the nest
+- `cHEIGHT`: centered height (mean subtracted off)
+
+A quick exploratory analysis reveals that the number of ticks varies over almost
+two orders of magnitude, with many zeros. The overall mean number of ticks is
+`mean(grouseticks$TICKS)`, while the variance is `var(grouseticks$TICKS)`. This
+indicates that the stochastic process that generated these observations was not
+simply Poisson; the variance is much too large.
+
+```{r}
+ggplot(grouseticks, aes(x = TICKS)) +
+  geom_histogram(stat = "count")
+```
+
+Note that broods with more ticks also have larger variance in number of ticks.
+So a Poisson process with some covariates may be appropriate.
+
+```{r}
+ggplot(grouseticks, aes(x = BROOD, y = TICKS, color = LOCATION)) +
+  geom_point()
+```
+
+Number of ticks appears to be inversely related to chick height. 
+
+```{r}
+ggplot(grouseticks, aes(x = HEIGHT, y = log(TICKS))) +
+  geom_point() +
+  geom_smooth(method = lm)
+```
+
+# The model
+
+I tend to write my models "in reverse", from the observations back to the
+parameter values. New values would be simulated "forward" from parameter values
+to observations.
+
+We will model this as a Poisson GLM with a log link. The number of ticks in the
+$i\text{th}$ observation, $Y_i$, is then
+
+$$Y_{i} \sim \operatorname{Poisson}(\lambda_{i})$$
+
+Where the value of $\lambda_{i}$ depends on the intercept $\mu$, (centered)
+chick height $h_{i}$ and the parameter $\delta$, the effect of location $l$,
+$\gamma_{l}$, and the effect of brood $b$, $\beta_{b}$. One way to consider the
+$\gamma$ and $\beta$ parameters is that we expect individuals to be more similar
+if they are in the same location, and even more similar if they are in the same
+brood. Then we have
+
+$$\lambda_{i} = \exp(\mu + \delta h_{i} + \gamma_{i} + \beta_{i}).$$
+
+Note that this is an equality statement rather than a "sampling statement" as
+above. Now we need to place priors on the parameters $\mu$, and $\delta$, as
+well as each of the $\gamma$ and $\beta$ parameters. Not including a prior puts
+an implicit "flat" prior on the parameter in Stan, and may cause computational
+issues. It is also not always as uninformative as it appears.
+
+Probably the best way to get a feel for priors is to use "prior predictive
+checks". Here we will use a prior predictive check for $\mu$. It is possible to
+integrate this into your Stan model to avoid duplicating code, but it's easy
+enough here to explore reasonable values for $\mu$ using the random number
+generators in R. We will generate a value for $\mu$ from our prior, then use
+that to generate multiple datasets to see if they look "reasonable". We'll place
+a normal prior on $\mu$, so we need to decide on a mean and a standard deviation
+to parameterize the prior.
+
+```{r}
+mu_priorpred <- function(n, mean, sd) {
+  mu <- rnorm(1, mean, sd)
+  rpois(n, exp(mu))
+}
+
+mu_pp_hist <- function(m, mean, sd) {
+  df <- tibble(ticks = c(replicate(m, mu_priorpred(403, mean, sd))))
+  ggplot(df, aes(x = ticks)) +
+    geom_histogram(stat = "count")
+}
+```
+
+Let's start with a $\operatorname{normal}(0, 10)$ prior; that seems pretty
+uninformative right?
+
+```{r}
+mu_pp_hist(100, 0, 10)
+```
+
+Uh oh. You can't see any of the histogram bars because the x-axis ranges over 9
+order of magnitude. We're putting some prior mass (you can think of it as some
+belief) that the number of ticks on a chick's head is in the billions range.
+Exponentials are dangerous! We could reduce the mean, but the standard deviation
+is going to be more important here.
+
+```{r}
+mu_pp_hist(1000, 0, 1)
+```
+
+Hmm... this looks a bit too "tight" to me. It does make sense that there might
+be many chicks with zero ticks on their head though. Maybe slightly increase the
+mean and the variance of the prior.
+
+```{r}
+mu_pp_hist(1000, 1, 1.1)
+```
+
+This prior places most of the mass at low numbers, but has a long tail. Note
+that we expect more variance in our observations once we include our covariates. So
+
+$$\mu \sim \operatorname{normal}(1, 1.1^{2})$$
+
+A normal prior centered at zero seems reasonable for our $\delta$ parameter.
+
+$$\delta \sim \operatorname{normal}(0, 2)$$
+
+We can place similar priors on the $\gamma$ and $\beta$ parameters (though it would be better to place a *joint* prior on all these prior simultaneously).
+
+$$\beta \sim \operatorname{MVN}(0, \sigma_{\beta}^{2}\boldsymbol{I})$$
+$$\gamma \sim \operatorname{MVN}(0, \sigma_{\gamma}^{2}\boldsymbol{I})$$
+
+
+## An improvement
+
+Because broods are nested within locations, it is a good idea to place a *joint*
+prior on these parameters by accounting for the fact that variance needs to be
+*partitioned* between these effects. See e.g. [Fuglstad et al.
+(2019)](http://arxiv.org/abs/1902.00242) for one way to do this.
+
+## The full model
+
+$$Y_{i} \sim \operatorname{Poisson}(\lambda_{i})$$
+$$\lambda_{i} = exp(\mu + \delta h_{i} + \gamma_{g} + \beta_{b})$$
+$$\mu \sim \operatorname{normal}(1, 1.1^{2})$$
+$$\delta \sim \operatorname{normal}(0, 2)$$
+$$\beta \sim \operatorname{MVN}(0, \sigma_{\beta}^{2}\boldsymbol{I})$$
+$$\gamma \sim \operatorname{MVN}(0, \sigma_{\gamma}^{2}\boldsymbol{I})$$
+
+It is preferred to use a separate file for a Stan model, so fill in the blanks
+(`____`) in `ticks.stan` to match this model. It may not all match up perfectly
+because there are vectorized functions available.
+
+# Run it!
+
+First construct the data as a `list` with elements matching the names declared
+in `ticks.stan`. I am proprocessing the data by:
+
+-_Rescaling `cHEIGHT` so that it has standard deviation one as well as mean
+zero, then making sure it is a vector rather than a matrix; this makes setting a
+prior on $\delta$ easier.
+- Note that we need to reindexing `BROOD` and `LOCATION` so that they use
+consecutive numbers starting from one. I do this by converting it to a factor
+and then converting the factor to an integer.
+
+```{r}
+
+ticks_data <- list(nobs = nrow(grouseticks),
+                   nlocations = length(unique(grouseticks$LOCATION)),
+                   nbroods = length(unique(grouseticks$BROOD)),
+                   ticks = grouseticks$TICKS,
+                   cheight = c(scale(grouseticks$cHEIGHT)),
+                   location = as.integer(factor(grouseticks$LOCATION)),
+                   brood = as.integer(factor(grouseticks$BROOD)))
+ticks_fit <- stan("src/ticks.stan",
+                  data = tick_data,
+                  chains = 4, iter = 2000, warmup = 1000)
+```
+
+Uh oh! Warnings of low effective sample sizes! First we'll check the traceplots.
+
+```{r}
+traceplot(ticks_fit,
+          pars = c("mu",
+                   "gamma[1]", "gamma[2]",
+                   "beta[1]", "beta[2]",
+                   "sig_gamma", "sig_beta"))
+```
+
+It looks like the problem is probably in `sig_gamma`. Broods are nested *within*
+locations, so the model is having trouble partitioning variance between these
+two. Following [Fuglstad et al. (2019)](http://arxiv.org/abs/1902.00242) we can
+put a *joint prior* on $\sigma_{\beta}$ and $\sigma_{\gamma}$ to address this.
+We replace the separate priors specified above with a prior on the *total
+variance*, using a Student's $t$ distribution to allow fatter tails, and then
+placing a Beta prior on the proportion $p_{\gamma}$ of variance that goes to the
+location and component of the model. My prior is that more of the variance would
+come from location than brood, so the prior reflects that.
+
+$$\sigma^2_{tot} \sim \operatorname{t}_3(0, 1) \quad \sigma^2_{tot} > 0$$
+$$p_{\gamma} \sim \operatorname{Beta}(2, 1)$$
+$$\sigma_\gamma = \sqrt{p_\gamma \sigma^2_{tot}}$$
+$$\sigma_\beta = \sqrt{(1 - p_\gamma) \sigma^2_{tot}}$$
+
+See `ticks2.stan`. We 
+
+```{r}
+ticks2_fit <- stan("ticks2.stan",
+                   data = tick_data,
+                   chains = 4, iter = 2000, warmup = 1000)
+```
+
+```{r}
+traceplot(ticks2_fit,
+          pars = c("mu",
+                   "gamma[1]", "gamma[2]",
+                   "beta[1]", "beta[2]",
+                   "p_gamma", "sig_gamma", "sig_beta"))
+```
