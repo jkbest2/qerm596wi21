@@ -18,7 +18,16 @@ library(tidyverse)
 ## Use parallel cores for different chains as recommended in the rstan package
 ## message
 options(mc.cores = parallel::detectCores())
+```
+
+```{r echo=FALSE}
+## Options for knitting
 options(digits = 2)
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE,
+                      cache = TRUE,
+                      fig.height = 6,
+                      fig.width = 8)
 ```
 
 
@@ -136,47 +145,54 @@ be many chicks with zero ticks on their head though. Maybe slightly increase the
 mean and the variance of the prior.
 
 ```{r}
-mu_pp_hist(1000, 1, 1.1)
+mu_pp_hist(1000, 1, 1.25)
 ```
 
 This prior places most of the mass at low numbers, but has a long tail. Note
 that we expect more variance in our observations once we include our covariates. So
 
-$$\mu \sim \operatorname{normal}(1, 1.1^{2})$$
+$$\mu \sim \operatorname{normal}(1, 1.25^{2})$$
 
 A normal prior centered at zero seems reasonable for our $\delta$ parameter.
 
-$$\delta \sim \operatorname{normal}(0, 2)$$
+$$\delta \sim \operatorname{normal}(0, 1)$$
 
 We can place similar priors on the $\gamma$ and $\beta$ parameters (though it would be better to place a *joint* prior on all these prior simultaneously).
 
-$$\beta \sim \operatorname{MVN}(0, \sigma_{\beta}^{2}\boldsymbol{I})$$
 $$\gamma \sim \operatorname{MVN}(0, \sigma_{\gamma}^{2}\boldsymbol{I})$$
 
+Of course, now we need a prior for $\sigma_\gamma$. Following the penalized
+complexity (PC) prior framework, I am choosing an exponential prior so that
+$\Pr(\sigma_\gamma > 0.3) = 0.05)$. This has the effect of "shrinking" the
+posterior toward a base model where location has no effect. **NOTE** that it is
+important to double check the parameterization of distributions. The
+exponential, for example, can be parameterized in terms of its *rate* or its
+*mean*. Stan uses the *rate*, as do the `dexp`, `pexp`, `qexp`, and `rexp`
+functions in R.
 
-## An improvement
-
-Because broods are nested within locations, it is a good idea to place a *joint*
-prior on these parameters by accounting for the fact that variance needs to be
-*partitioned* between these effects. See e.g. [Fuglstad et al.
-(2019)](http://arxiv.org/abs/1902.00242) for one way to do this.
+$$\sigma_{\gamma} \sim \operatorname{exponential}(10)$$
 
 ## The full model
 
 $$Y_{i} \sim \operatorname{Poisson}(\lambda_{i})$$
-$$\lambda_{i} = exp(\mu + \delta h_{i} + \gamma_{g} + \beta_{b})$$
-$$\mu \sim \operatorname{normal}(1, 1.1^{2})$$
-$$\delta \sim \operatorname{normal}(0, 2)$$
-$$\beta \sim \operatorname{MVN}(0, \sigma_{\beta}^{2}\boldsymbol{I})$$
+$$\lambda_{i} = \exp(\mu + \delta h_{i} + \gamma_{g})$$
+$$\mu \sim \operatorname{normal}(1, 1.25^{2})$$
+$$\delta \sim \operatorname{normal}(0, 1)$$
 $$\gamma \sim \operatorname{MVN}(0, \sigma_{\gamma}^{2}\boldsymbol{I})$$
+$$\sigma_\gamma \sim \operatorname{exponential}(10)$$
 
 It is preferred to use a separate file for a Stan model, so fill in the blanks
 (`____`) in `ticks.stan` to match this model. It may not all match up perfectly
 because there are vectorized functions available.
 
-# Run it!
+## A prior predictive check in R
 
-First construct the data as a `list` with elements matching the names declared
+Now that we have a model fully specified, we can do a prior predictive check. In
+this case I will just write a function in R. We can use the same data set that
+we'll pass to Stan later. It is also possible to write prior predictive checks
+in Stan.
+
+We construct the data as a `list` with elements matching the names declared
 in `ticks.stan`. I am proprocessing the data by:
 
 -_Rescaling `cHEIGHT` so that it has standard deviation one as well as mean
@@ -187,7 +203,6 @@ consecutive numbers starting from one. I do this by converting it to a factor
 and then converting the factor to an integer.
 
 ```{r}
-
 ticks_data <- list(nobs = nrow(grouseticks),
                    nlocations = length(unique(grouseticks$LOCATION)),
                    nbroods = length(unique(grouseticks$BROOD)),
@@ -195,48 +210,106 @@ ticks_data <- list(nobs = nrow(grouseticks),
                    cheight = c(scale(grouseticks$cHEIGHT)),
                    location = as.integer(factor(grouseticks$LOCATION)),
                    brood = as.integer(factor(grouseticks$BROOD)))
-ticks_fit <- stan("src/ticks.stan",
-                  data = tick_data,
-                  chains = 4, iter = 2000, warmup = 1000)
+
+ticks_priorpred <- function(ticks_data) {
+  sig_gamma <- rexp(1, 10)
+  gamma <- rnorm(ticks_data$nlocations, 0, sig_gamma)
+  delta <- rnorm(1, 0, 0.5)
+  mu <- rnorm(1, 1.25)
+  lambda <- exp(mu + delta * ticks_data$cheight + gamma[ticks_data$location])
+  rpois(ticks_data$nobs, lambda)
+}
+```
+
+A histogram of the resulting tick counts looks reasonable, with most chicks
+having zero or few ticks, but with a long tail to allow for chicks that may have
+severe infestations.
+
+```{r}
+pp <- data.frame(ticks = as.vector(replicate(100, ticks_priorpred(ticks_data))))
+ggplot(pp, aes(x = ticks)) +
+  geom_histogram(stat = "count")
+```
+
+# Run it!
+
+To avoid warnings about low effective sample sizes, I increase the number of
+iterations to 4,000 and the warmup to 2,000.
+
+```{r}
+ticks_fit <- stan("ticks_model_complete.stan",
+                  data = ticks_data,
+                  chains = 4, iter = 4000, warmup = 2000)
+```
+
+First we can check the summary of the fit:
+
+```{r}
+ticks_fit
 ```
 
 Uh oh! Warnings of low effective sample sizes! First we'll check the traceplots.
 
 ```{r}
-traceplot(ticks_fit,
-          pars = c("mu",
-                   "gamma[1]", "gamma[2]",
-                   "beta[1]", "beta[2]",
-                   "sig_gamma", "sig_beta"))
+traceplot(ticks_fit)
 ```
 
-It looks like the problem is probably in `sig_gamma`. Broods are nested *within*
-locations, so the model is having trouble partitioning variance between these
-two. Following [Fuglstad et al. (2019)](http://arxiv.org/abs/1902.00242) we can
-put a *joint prior* on $\sigma_{\beta}$ and $\sigma_{\gamma}$ to address this.
-We replace the separate priors specified above with a prior on the *total
-variance*, using a Student's $t$ distribution to allow fatter tails, and then
-placing a Beta prior on the proportion $p_{\gamma}$ of variance that goes to the
-location and component of the model. My prior is that more of the variance would
-come from location than brood, so the prior reflects that.
+This could be an opportunity to identify why the sampler is having difficulty,
+which might indicate a missing covariate, correlated parameters, or other
+issues. The `ShinyStan` package is helpful for interactive evaluation like this.
 
-$$\sigma^2_{tot} \sim \operatorname{t}_3(0, 1) \quad \sigma^2_{tot} > 0$$
-$$p_{\gamma} \sim \operatorname{Beta}(2, 1)$$
-$$\sigma_\gamma = \sqrt{p_\gamma \sigma^2_{tot}}$$
-$$\sigma_\beta = \sqrt{(1 - p_\gamma) \sigma^2_{tot}}$$
+We can also check our posterior predictive simulations to evaluate model fit. It
+takes some manipulation of the posterior object that Stan produces.
 
-See `ticks2.stan`. We 
+```{r warning=FALSE}
+ticks_postpred <- as.data.frame(ticks_fit, pars = "sim_ticks") %>%
+  pivot_longer(cols = starts_with("sim_ticks"),
+               names_to = "INDEX",
+               names_pattern = "sim_ticks\\[(.*)\\]",
+               values_to = "TICKS") %>%
+  left_join(select(grouseticks, INDEX, LOCATION),
+            by = "INDEX")
+```
+
+We can look at the results graphically, and compare them to the data.
 
 ```{r}
-ticks2_fit <- stan("ticks2.stan",
-                   data = tick_data,
-                   chains = 4, iter = 2000, warmup = 1000)
+locs <- 1:21
+ticks_postpred %>%
+  filter(LOCATION %in% locs) %>%
+ggplot(aes(x = TICKS)) +
+  geom_histogram(stat = "count") +
+  geom_vline(aes(xintercept = TICKS),
+             data = filter(grouseticks, LOCATION %in% locs),
+             position = position_jitter(width = 0.8), alpha = 0.5) +
+  facet_wrap(~ LOCATION, scale = "free_x")
 ```
 
 ```{r}
-traceplot(ticks2_fit,
-          pars = c("mu",
-                   "gamma[1]", "gamma[2]",
-                   "beta[1]", "beta[2]",
-                   "p_gamma", "sig_gamma", "sig_beta"))
+locs <- 22:42
+ticks_postpred %>%
+  filter(LOCATION %in% locs) %>%
+ggplot(aes(x = TICKS)) +
+  geom_histogram(stat = "count") +
+  geom_vline(aes(xintercept = TICKS),
+             data = filter(grouseticks, LOCATION %in% locs),
+             position = position_jitter(width = 0.8), alpha = 0.5) +
+  facet_wrap(~ LOCATION, scale = "free_x")
 ```
+
+```{r}
+locs <- 43:63
+ticks_postpred %>%
+  filter(LOCATION %in% 43:63) %>%
+ggplot(aes(x = TICKS)) +
+  geom_histogram(stat = "count") +
+  geom_vline(aes(xintercept = TICKS),
+             data = filter(grouseticks, LOCATION %in% locs),
+             position = position_jitter(width = 0.8), alpha = 0.5) +
+  facet_wrap(~ LOCATION, scale = "free_x")
+```
+
+It looks like accounting for variation by location isn't enough. It would be
+worth checking whether allowing for variation by brood allows for a better fit.
+This would be an interesting result in itself, potentially indicating that
+susceptibility to ticks is brood-dependent more than location-dependent.
