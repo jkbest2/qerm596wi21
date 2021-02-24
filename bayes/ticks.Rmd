@@ -313,3 +313,9 @@ It looks like accounting for variation by location isn't enough. It would be
 worth checking whether allowing for variation by brood allows for a better fit.
 This would be an interesting result in itself, potentially indicating that
 susceptibility to ticks is brood-dependent more than location-dependent.
+
+# Computing environment
+
+```{r}
+sessionInfo()
+```
